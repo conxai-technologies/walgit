@@ -1308,10 +1308,11 @@ async fn default_branch_is_chosen_at_creation_healed_by_push_and_moved_by_admin(
                 .await
             }
         };
-    const WRITER: &[(&str, &str)] = &[("Authorization", "Bearer writer-token")];
-    const ADMIN: &[(&str, &str)] = &[("Authorization", "Bearer admin-token")];
+    // Promoted constants (`'static`, as the closure needs), not items after statements.
+    let writer_hdr: &'static [(&str, &str)] = &[("Authorization", "Bearer writer-token")];
+    let admin_hdr: &'static [(&str, &str)] = &[("Authorization", "Bearer admin-token")];
     assert_eq!(
-        put_head("api", WRITER, r#"{"branch":"zeta"}"#).await?.0,
+        put_head("api", writer_hdr, r#"{"branch":"zeta"}"#).await?.0,
         403
     );
     for bad in [
@@ -1320,18 +1321,18 @@ async fn default_branch_is_chosen_at_creation_healed_by_push_and_moved_by_admin(
         r#"{"name":"zeta"}"#,
         "zeta",
     ] {
-        let (st, text) = put_head("api", ADMIN, bad).await?;
+        let (st, text) = put_head("api", admin_hdr, bad).await?;
         assert_eq!(st, 400, "{bad}: {text}");
     }
-    let (st, text) = put_head("api", ADMIN, r#"{"branch":"nope"}"#).await?;
+    let (st, text) = put_head("api", admin_hdr, r#"{"branch":"nope"}"#).await?;
     assert_eq!(st, 409, "{text}");
-    let (st, text) = put_head("api", ADMIN, r#"{"branch":"zeta"}"#).await?;
+    let (st, text) = put_head("api", admin_hdr, r#"{"branch":"zeta"}"#).await?;
     assert_eq!(st, 200, "{text}");
     let moved: Value = serde_json::from_str(&text)?;
     assert_eq!(moved["head"]["name"], "zeta");
     assert_eq!(moved["head"]["sha"].as_str().map(str::len), Some(40));
     assert!(moved["seq"].as_u64().unwrap() > 0);
-    let (st, text) = put_head("api-browser", ADMIN, r#"{"branch":"zeta"}"#).await?;
+    let (st, text) = put_head("api-browser", admin_hdr, r#"{"branch":"zeta"}"#).await?;
     assert_eq!(st, 200, "{text}");
     assert_eq!(
         serde_json::from_str::<Value>(&text)?["seq"],
