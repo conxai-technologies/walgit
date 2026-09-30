@@ -1,5 +1,6 @@
 //! Admin endpoints: `PUT /{owner}/{repo}` (create), `DELETE /{owner}/{repo}`
-//! (delete manifest + prefix objects), `GET /` (list repos, text/plain).
+//! (delete manifest + prefix objects), `PUT /{o}/{r}/api/head` (move HEAD),
+//! `GET /` (list repos, text/plain).
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -9,13 +10,15 @@ use crate::AppState;
 use crate::error::ApiError;
 use crate::repo::RepoRoute;
 
-/// `PUT /{owner}/{repo}[?object_format=sha1|sha256][&description=…]` — create repo. 201 on
-/// new, 409 if it exists. `description` (percent-encoded, `crate::metadata` rules) is
-/// validated before anything is created and written once the create succeeded. It needs
-/// **admin**, like every other description write: a create is not proof of a *new*
-/// repository (`Registry::create` answers `Ok` with the cached handle when this instance
-/// already has the repository open), so write permission alone must never be able to
-/// relabel an existing one. Without `description`, create stays a write operation.
+/// `PUT /{owner}/{repo}[?object_format=sha1|sha256][&default_branch=<name>][&description=…]` —
+/// create repo. 201 on new, 409 if it exists, 400 for an unsupported format, an invalid branch
+/// name or an invalid description. `default_branch` (a short name) overrides
+/// `git.default_branch` as HEAD's target (D52). `description` (percent-encoded,
+/// `crate::metadata` rules) is validated before anything is created and written once the create
+/// succeeded. It needs **admin**, like every other description write: a create is not proof of
+/// a *new* repository (`Registry::create` answers `Ok` with the cached handle when this instance
+/// already has the repository open), so write permission alone must never be able to relabel an
+/// existing one. Without `description`, create stays a write operation.
 pub async fn create(
     st: &AppState,
     route: &RepoRoute,
@@ -31,10 +34,17 @@ pub async fn create(
         st.auth.require_write(headers).await
     }
     .map_err(auth_err)?;
-    let format = match query
-        .split('&')
-        .find_map(|part| part.strip_prefix("object_format="))
-    {
+    let param = |key: &str| {
+        query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| crate::settings::percent_decode(v))
+    };
+    let branch = param("default_branch").unwrap_or_else(|| st.cfg.git.default_branch.clone());
+    walgit_config::refs::branch_ref(&branch)
+        .map_err(|e| ApiError::BadRequest(format!("default_branch: {e}")))?;
+    let format = match param("object_format").as_deref() {
         Some("sha256") => ObjectFormat::Sha256,
         Some("sha1") => ObjectFormat::Sha1,
         Some(other) => {
@@ -44,19 +54,21 @@ pub async fn create(
         }
         None => ObjectFormat::from(st.cfg.git.object_format),
     };
-    let description = query
-        .split('&')
-        .find_map(|part| part.strip_prefix("description="))
+    let description = param("description")
         .map(|v| {
             crate::metadata::clean_text(
                 "description",
-                &crate::settings::percent_decode(v),
+                &v,
                 crate::metadata::DESCRIPTION_MAX_CHARS,
             )
             .map_err(ApiError::BadRequest)
         })
         .transpose()?;
-    match st.registry.create(&route.id, format).await {
+    match st
+        .registry
+        .create_with_default_branch(&route.id, format, &branch)
+        .await
+    {
         Ok(_h) => {
             if let Some(description) = description {
                 let doc = crate::metadata::RepoDescription {
@@ -90,6 +102,52 @@ pub async fn delete(
     let _principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
     st.registry.delete(&route.id).await.map_err(wal_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeadRequest {
+    /// Short branch name (`main`), as `git.default_branch`.
+    branch: String,
+}
+
+/// `PUT /{o}/{r}/api[-browser]/head` `{"branch": "<name>"}` — point HEAD at an existing
+/// branch (admin). One WAL entry through the push publisher (`RepoHandle::publish_head`):
+/// CAS-checked like any ref update, the branch's existence re-checked on every attempt.
+/// 200 `{head: {name, sha}, seq}` (`seq` 0 = HEAD was already there, nothing written);
+/// 400 invalid name/body, 404 unknown repository, 409 the branch does not exist.
+pub async fn set_head(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, ApiError> {
+    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let bytes = crate::collect_body(body).await?;
+    let req: HeadRequest = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::BadRequest(format!("expected {{\"branch\": \"<name>\"}}: {e}")))?;
+    let target = walgit_config::refs::branch_ref(&req.branch)
+        .map_err(|e| ApiError::BadRequest(format!("branch: {e}")))?;
+    let handle = st.registry.open(&route.id).await.map_err(wal_err)?;
+    let meta = std::collections::HashMap::from([("principal".to_string(), principal.name)]);
+    let result = handle.publish_head(&target, meta).await.map_err(wal_err)?;
+    if let Some((_, Err(e))) = result.per_ref.iter().find(|(name, _)| name == "HEAD") {
+        return Err(ApiError::Conflict(e.to_string()));
+    }
+    let sha = handle
+        .local()
+        .ref_view()
+        .map_err(|e| ApiError::Internal(format!("refs: {e}")))?
+        .get(&target)
+        .unwrap_or_default();
+    Ok((
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "head": {"name": req.branch, "sha": sha},
+            "seq": result.seq,
+        })),
+    )
+        .into_response())
 }
 
 /// `GET /` — list repos as text/plain, one `owner/name` per line.
@@ -127,6 +185,7 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
 fn wal_err(e: walgit_wal::WalError) -> ApiError {
     match &e {
         walgit_wal::WalError::NotFound => ApiError::NotFound(e.to_string()),
+        walgit_wal::WalError::Invalid(why) => ApiError::BadRequest(why.clone()),
         _ => ApiError::Internal(format!("wal: {e}")),
     }
 }
