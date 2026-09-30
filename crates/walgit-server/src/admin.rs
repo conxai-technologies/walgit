@@ -56,12 +56,8 @@ pub async fn create(
     };
     let description = param("description")
         .map(|v| {
-            crate::metadata::clean_text(
-                "description",
-                &v,
-                crate::metadata::DESCRIPTION_MAX_CHARS,
-            )
-            .map_err(ApiError::BadRequest)
+            crate::metadata::clean_text("description", &v, crate::metadata::DESCRIPTION_MAX_CHARS)
+                .map_err(ApiError::BadRequest)
         })
         .transpose()?;
     match st
