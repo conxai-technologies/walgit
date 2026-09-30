@@ -300,7 +300,12 @@ removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{rep
 `git.object_format`, `git.default_branch`, none): `default_branch` is HEAD's branch as a short name (`main`,
 `release%2Fnext`), `400` when Git would not accept it as a branch. `description` (percent-encoded) is validated
 before anything is created (`400`, nothing created) and needs **admin**, like every description write — create
-alone stays a write operation. `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
+alone stays a write operation.
+
+`GET|PUT|DELETE …/policy` is the repository's own push policy document (`docs/POLICY.md`; `GET` of none = the
+empty document). `GET …/policy/effective` → `{layers: [{source, policy}]}`, every document a push is judged
+against in evaluation order: `{"source": "baseline", …}` only when the host has a `[policy] baseline`, then
+`{"source": "repository", …}` (the `GET …/policy` document). An update must pass every layer. `no-store`.
 
 `GET|PUT|DELETE /{o}/{r}/api/description` is the repository's **description**
 (`repos/<o>/<r>/description.json`, not on the WAL, never read by git): `GET` (read) →
@@ -340,7 +345,8 @@ detail,upstream:{ref:oid},ours:{ref:oid}}|null} (D33; last_round = this instance
 fields:[{key,value,host_value,source: host|setting}], head_seq}`; `POST …/settings/validate` (body TOML) → the same
 shape for the *would-be* effective config with `ok: true`, or `{ok: false, errors[]}` (nothing published);
 `POST …/policy/validate` (body policy JSON) → `{ok, errors[], rules, groups, protect}`; `POST …/policy/dry-run?last=N`
-(body policy JSON, empty = the saved policy) → the policy evaluated against the last N PUSH entries of the live log
+(body policy JSON, empty = the saved policy) → the policy evaluated, after the host baseline as receive-pack would
+(a baseline denial reads `rejected by baseline rule '<name>'`), against the last N PUSH entries of the live log
 (`{pushes, allowed, denied, results:[{seq,at,principal,atomic,refs:[{name,ok,reason,force}]}]}`; force = non-ancestor
 update when objects are local). SDK: `repo.settings.{get,put,delete,effective,history,describe,validate}`,
 `repo.policy.{validate,dryRun}`.

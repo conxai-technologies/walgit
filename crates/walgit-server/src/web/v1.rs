@@ -21,7 +21,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, put},
 };
 use serde::Serialize;
 
@@ -67,7 +67,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                 &format!("{base}/policy"),
                 get(repo_admin).put(repo_admin).delete(repo_admin),
             )
-            .route(&format!("{base}/policy/{{sub}}"), post(repo_admin_sub))
+            .route(
+                &format!("{base}/policy/{{sub}}"),
+                get(repo_admin_sub).post(repo_admin_sub),
+            )
             .route(
                 &format!("{base}/description"),
                 get(repo_admin).put(repo_admin).delete(repo_admin),
@@ -259,6 +262,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "POST /{owner}/{repo}/api/ops/{op}",
             "GET|PUT|DELETE /{owner}/{repo}/api/description",
             "GET|PUT|DELETE /{owner}/{repo}/api/policy",
+            "GET  /{owner}/{repo}/api/policy/effective",
             "POST /{owner}/{repo}/api/policy/validate | dry-run?last=N",
             "GET|PUT|DELETE /{owner}/{repo}/api/settings",
             "GET  /{owner}/{repo}/api/settings/effective | history | describe",
@@ -401,7 +405,8 @@ async fn owner_profile(
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
-/// `GET|POST /{o}/{r}/api[-browser]/settings/{sub}` (effective | history | validate) and `POST …/policy/{sub}`.
+/// `GET|POST /{o}/{r}/api[-browser]/settings/{sub}` (effective | history | validate) and
+/// `GET|POST …/policy/{sub}` (effective | validate | dry-run).
 async fn repo_admin_sub(
     State(st): State<Arc<AppState>>,
     Path((owner, name, _sub)): Path<(String, String, String)>,

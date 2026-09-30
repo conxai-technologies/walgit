@@ -142,6 +142,8 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `cache/api/v1/<sha1>.json` | Shared render cache of immutable web API answers. |
 | `policy.json` | Per-repo push policy (rule language, not on the WAL). `docs/POLICY.md`. Missing = allow-all. |
 | `description.json` | Per-repo human-readable description (`{"description"}`, not on the WAL, never read by git; D51). Missing = none. |
+
+| `policy.json` | Per-repo push policy (rule language, not on the WAL). `docs/POLICY.md`. Missing = allow-all, except for a host `[policy] baseline`, which applies to every repository as well. |
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
 | `events/cursor.json` | Durable acknowledged WAL sequence of the events bridge; advanced only after the webhook acknowledged (D32). |
 | `lfs/objects/<aa>/<bb>/<oid>` | LFS objects (sha256-addressed, immutable). Missing ones can be read through from `upstream.lfs` and persisted (`docs/LFS.md`). |
@@ -301,7 +303,8 @@ Unrelated constraints remain in force. The current design target and migration g
   tasks, policy, description, settings) so the repository prefix determines placement. The browser lane is
   `/{o}/{r}/api-browser/…`; `/api/v1` is non-repository discovery, identity and owner listing. No aliases.
 - **D16** Push authorization is a per-repo **rule language** at `repos/<o>/<r>/policy.json` (`docs/POLICY.md`).
-  Envelope `version` + `groups` + `rules`; `protect` = AND. Empty/missing = anyone with write may move any ref.
+  Envelope `version` + `groups` + `rules`; `protect` = AND. Empty/missing = anyone with write may move any ref
+  (unless the host has a baseline: *host baseline push policy*, below).
 - **D17 (historical; superseded by D42)** `bundles.require` refuses only **unbounded** zero-have fetches (no `deepen*`, no `filter`): that is a
   full clone and belongs to bundle-uri. Bounded zero-have fetches (CI's `--depth`/`--filter`) go to upload-pack.
   git never retries a failed bundle download and then falls back to a zero-have fetch; a principal that fetched
@@ -533,6 +536,18 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   extra request. `PUT /{o}/{r}/api/head` (admin) retargets through the same publisher, the branch re-checked
   on every attempt, idempotent. Receive-pack refuses `HEAD` as a command name (`funny refname`), so policy
   sees every ref move; HEAD retargets emit no events (D32).
+
+- **D53 (2026-09-30): Host baseline push policy — both documents apply.** `[policy] baseline = "<path>"`
+  names one more document in the D16 language, read at startup with the `policy.json` parser and validator
+  (unreadable or invalid = no start, `walgit config check` fails) and held in memory (0 store
+  requests). **Both apply:** a push is judged against the baseline, then the repository's own `policy.json`,
+  and must pass both — the `protect` AND carried across documents, so order only picks the named rule
+  (`rejected by baseline rule '<name>'` first). Each document resolves `group:` against its own roster. Not
+  "own replaces baseline": the language has no admitting effect, so AND lets a repository add restrictions and
+  never lift one, and no per-repo write (nor `PUT` of an empty document) can drop the host's protection;
+  exceptions are the operator's. Host-only like auth: not a settings section, same file on every host that
+  runs receive-pack. `GET …/policy` stays the repository's document; `GET …/policy/effective` lists the layers;
+  dry-run judges after the baseline. The overlapping-bypass check stays per document (`docs/POLICY.md`).
 
 ## 5. Working rules
 

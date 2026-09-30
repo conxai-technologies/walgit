@@ -1,8 +1,11 @@
 //! Per-repo push policy. Language: `docs/POLICY.md`.
 //!
 //! Stored at `repos/<owner>/<repo>/policy.json` (not on the WAL). Missing file
-//! = empty rules = allow-all. Receive-pack evaluates after ingest so
-//! force-push can use `merge-base --is-ancestor`.
+//! = empty rules = allow-all. A host may add a **baseline** (`[policy] baseline`,
+//! one more document of the same language, parsed at startup, held in memory):
+//! every push is judged against the baseline and then the repository's own
+//! document, each with its own roster, and must pass both. Receive-pack
+//! evaluates after ingest so force-push can use `merge-base --is-ancestor`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -487,20 +490,47 @@ impl Eval {
     }
 }
 
+/// Whether a push needs force detection (`merge-base --is-ancestor` per update).
+pub fn needs_force_check(baseline: Option<&RepoPolicy>, repo: &RepoPolicy) -> bool {
+    baseline.is_some_and(RepoPolicy::has_protect) || repo.has_protect()
+}
+
+/// Judge `txn` against the host baseline (if any), then the repository's own
+/// document. An update is allowed only if **both** allow it: `protect` is AND
+/// across documents exactly as within one, so the order never changes a verdict,
+/// only which rule is named (the first denying rule, baseline first). Each
+/// document resolves `group:` against its own roster; a repository cannot join a
+/// baseline group by defining one with the same name.
+///
 /// `is_force` is true when `new` is not a descendant of `old` (after ingest).
 /// Tag retargets are treated as force regardless.
 pub fn evaluate(
-    policy: &RepoPolicy,
+    baseline: Option<&RepoPolicy>,
+    repo: &RepoPolicy,
     principal: &str,
     txn: &RefTransaction,
     is_force: impl Fn(&RefUpdate) -> bool,
 ) -> Eval {
-    let groups: HashMap<&str, &Group> =
-        policy.groups.iter().map(|g| (g.name.as_str(), g)).collect();
+    fn roster(p: &RepoPolicy) -> HashMap<&str, &Group> {
+        p.groups.iter().map(|g| (g.name.as_str(), g)).collect()
+    }
+    let layers: Vec<(&RepoPolicy, HashMap<&str, &Group>, &str)> = baseline
+        .map(|b| (b, roster(b), "baseline rule"))
+        .into_iter()
+        .chain(std::iter::once((repo, roster(repo), "rule")))
+        .collect();
     let mut per_ref = Vec::with_capacity(txn.updates.len());
     let mut allowed = Vec::new();
     for u in &txn.updates {
-        match deny_reason(policy, &groups, principal, u, &is_force) {
+        let denied = if is_funny_refname(u) {
+            Some("funny refname".to_string())
+        } else {
+            layers.iter().find_map(|(p, groups, what)| {
+                deny_reason(p, groups, principal, u, &is_force)
+                    .map(|rule| format!("rejected by {what} '{rule}'"))
+            })
+        };
+        match denied {
             None => {
                 per_ref.push((u.name.clone(), Ok(())));
                 allowed.push(u.clone());
@@ -528,21 +558,24 @@ pub fn evaluate(
     }
 }
 
-fn deny_reason(
-    policy: &RepoPolicy,
+/// A pushed command names a ref under `refs/`, never `HEAD` (git's own receive-pack refuses
+/// it as a "funny refname"). `HEAD <oid>` would move HEAD's branch through the symref under a
+/// name no rule matches — around every `protect` on `refs/heads/*`, in the baseline and the
+/// repository's document alike. It is refused before any layer is consulted, under every
+/// policy including none. HEAD's target moves only by the WAL's heal rule, the admin route
+/// (D52) and import; all are symbolic updates, never pushed.
+fn is_funny_refname(u: &RefUpdate) -> bool {
+    u.new_symbolic_target.is_empty() && !u.name.starts_with("refs/")
+}
+
+/// The name of the first rule of `policy` that denies `u`.
+fn deny_reason<'p>(
+    policy: &'p RepoPolicy,
     groups: &HashMap<&str, &Group>,
     principal: &str,
     u: &RefUpdate,
     is_force: &impl Fn(&RefUpdate) -> bool,
-) -> Option<String> {
-    // A pushed command names a ref under `refs/`, never `HEAD` (git's own receive-pack refuses
-    // it as a "funny refname"). `HEAD <oid>` would move HEAD's branch through the symref under a
-    // name no rule matches — around every `protect` on `refs/heads/*`. HEAD's target moves only
-    // by the WAL's heal rule, the admin route (D52) and import; all are symbolic updates, never
-    // pushed.
-    if u.new_symbolic_target.is_empty() && !u.name.starts_with("refs/") {
-        return Some("funny refname".into());
-    }
+) -> Option<&'p str> {
     let op = classify(&u.old_oid, &u.new_oid);
     if op == RefOp::NoOp {
         return None;
@@ -569,7 +602,7 @@ fn deny_reason(
             RefOp::NoOp => false,
         };
         if hit {
-            return Some(format!("rejected by rule '{}'", rule.name));
+            return Some(&rule.name);
         }
     }
     None
@@ -626,12 +659,29 @@ pub fn parse_document(bytes: &[u8]) -> Result<RepoPolicy, StoreError> {
 }
 
 fn parse_bytes(bytes: &[u8]) -> Result<RepoPolicy, StoreError> {
-    let policy: RepoPolicy = serde_json::from_slice(bytes)
-        .map_err(|e| StoreError::InvalidArgument(format!("policy.json: {e}")))?;
-    policy
-        .validate()
-        .map_err(|e| StoreError::InvalidArgument(format!("policy.json: {e}")))?;
+    parse(bytes).map_err(|e| StoreError::InvalidArgument(format!("policy.json: {e}")))
+}
+
+/// The one parser + validator, for `policy.json` and the baseline alike.
+fn parse(bytes: &[u8]) -> Result<RepoPolicy, String> {
+    let policy: RepoPolicy = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    policy.validate()?;
     Ok(policy)
+}
+
+/// `[policy] baseline`, read and parsed once at startup (`AppState::new`,
+/// `walgit config check`). Unreadable or invalid is an error, never "no
+/// baseline": a host that meant to protect every repository must not come up
+/// allowing everything.
+pub fn load_baseline(cfg: &walgit_config::Config) -> anyhow::Result<Option<RepoPolicy>> {
+    let Some(path) = &cfg.policy.baseline else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("reading policy.baseline {}: {e}", path.display()))?;
+    let policy =
+        parse(&bytes).map_err(|e| anyhow::anyhow!("policy.baseline {}: {e}", path.display()))?;
+    Ok(Some(policy))
 }
 
 pub async fn save(store: &DynStore, id: &RepoId, policy: &RepoPolicy) -> Result<(), StoreError> {
@@ -677,6 +727,30 @@ pub async fn http_get(
             "application/json; charset=utf-8",
         )],
         body,
+    )
+        .into_response())
+}
+
+/// `GET …/policy/effective` → `{layers: [{source, policy}]}`: every document a
+/// push is judged against, in evaluation order — `baseline` (only when the host
+/// has one), then `repository` (the `GET …/policy` document; empty = none).
+pub async fn http_get_effective(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    ensure_repo(st, route).await?;
+    let repo = load(&st.store, &route.id).await.map_err(store_err)?;
+    let mut layers = Vec::new();
+    if let Some(b) = &st.policy_baseline {
+        layers.push(serde_json::json!({"source": "baseline", "policy": b}));
+    }
+    layers.push(serde_json::json!({"source": "repository", "policy": repo}));
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(serde_json::json!({ "layers": layers })),
     )
         .into_response())
 }
@@ -823,7 +897,7 @@ mod tests {
             ],
             false,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(None, &p, "bob@example.com", &t, |_| true);
         assert!(ev.per_ref.iter().all(|(_, r)| r.is_ok()));
         assert_eq!(ev.publish.updates.len(), 2);
     }
@@ -838,7 +912,7 @@ mod tests {
             ],
             false,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(None, &p, "bob@example.com", &t, |_| true);
         assert!(
             ev.per_ref[0]
                 .1
@@ -850,7 +924,7 @@ mod tests {
         assert_eq!(ev.publish.updates.len(), 1);
 
         let del = txn(vec![upd("refs/heads/main", "aaa", "")], false);
-        let ev = evaluate(&p, "bob@example.com", &del, |_| false);
+        let ev = evaluate(None, &p, "bob@example.com", &del, |_| false);
         assert!(ev.per_ref[0].1.as_ref().unwrap_err().contains("lock-main"));
         assert!(!ev.any_allowed());
     }
@@ -859,7 +933,7 @@ mod tests {
     fn ff_update_allowed() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "aaa", "bbb")], false);
-        let ev = evaluate(&p, "bob@example.com", &t, |_| false);
+        let ev = evaluate(None, &p, "bob@example.com", &t, |_| false);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -867,7 +941,7 @@ mod tests {
     fn group_bypass() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "aaa", "bbb")], false);
-        let ev = evaluate(&p, "Alice@example.com", &t, |_| true);
+        let ev = evaluate(None, &p, "Alice@example.com", &t, |_| true);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -875,7 +949,7 @@ mod tests {
     fn create_allowed_when_not_restricted() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "", "aaa")], false);
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(None, &p, "bob@example.com", &t, |_| true);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -884,24 +958,31 @@ mod tests {
     /// imports — never pushed) are not ref moves and pass.
     #[test]
     fn a_pushed_head_is_a_funny_refname_under_any_policy() {
-        for p in [RepoPolicy::empty(), lock_main()] {
-            let t = txn(vec![upd("HEAD", "aaa", "bbb")], false);
-            let ev = evaluate(&p, "Alice@example.com", &t, |_| false);
-            assert_eq!(ev.per_ref[0].1.as_ref().unwrap_err(), "funny refname");
-            assert!(!ev.any_allowed());
+        let b = baseline_example();
+        for baseline in [None, Some(&b)] {
+            for p in [RepoPolicy::empty(), lock_main()] {
+                let t = txn(vec![upd("HEAD", "aaa", "bbb")], false);
+                // A principal every layer would let through: the refusal is not a rule's.
+                for who in ["Alice@example.com", "svc:deploy"] {
+                    let ev = evaluate(baseline, &p, who, &t, |_| false);
+                    assert_eq!(ev.per_ref[0].1.as_ref().unwrap_err(), "funny refname");
+                    assert!(!ev.any_allowed());
+                }
+            }
+            let retarget = RefUpdate {
+                name: "HEAD".into(),
+                new_symbolic_target: "refs/heads/dev".into(),
+                ..Default::default()
+            };
+            let ev = evaluate(
+                baseline,
+                &lock_main(),
+                "bob@example.com",
+                &txn(vec![retarget], false),
+                |_| false,
+            );
+            assert!(ev.per_ref[0].1.is_ok());
         }
-        let retarget = RefUpdate {
-            name: "HEAD".into(),
-            new_symbolic_target: "refs/heads/dev".into(),
-            ..Default::default()
-        };
-        let ev = evaluate(
-            &lock_main(),
-            "bob@example.com",
-            &txn(vec![retarget], false),
-            |_| false,
-        );
-        assert!(ev.per_ref[0].1.is_ok());
     }
 
     #[test]
@@ -914,7 +995,7 @@ mod tests {
             ],
             true,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(None, &p, "bob@example.com", &t, |_| true);
         assert!(ev.any_denied());
         assert!(!ev.any_allowed());
         assert_eq!(ev.per_ref.len(), 2);
@@ -933,7 +1014,7 @@ mod tests {
         let p = parse_bytes(json.as_bytes()).unwrap();
         let t = txn(vec![upd("refs/tags/v1", "aaa", "bbb")], false);
         // even if merge-base would say ff
-        let ev = evaluate(&p, "bob@example.com", &t, |_| false);
+        let ev = evaluate(None, &p, "bob@example.com", &t, |_| false);
         assert!(ev.per_ref[0].1.is_err());
     }
 
@@ -1008,6 +1089,261 @@ mod tests {
           }]
         }"#;
         assert!(parse_bytes(json.as_bytes()).is_err());
+    }
+
+    /// The baseline example in `docs/POLICY.md`, verbatim (asserted below).
+    const BASELINE_EXAMPLE: &str = r#"{
+  "version": 1,
+  "_comment": "members work in draft/** and explore/**; production is the deploy robot's; the rest of refs/heads and refs/tags is automation's",
+  "rules": [
+    {
+      "name": "reserve-heads-and-tags",
+      "match": {
+        "refs": ["refs/heads/**", "refs/tags/**", "^refs/heads/draft/**", "^refs/heads/explore/**"]
+      },
+      "effect": { "protect": { "bypass": ["svc:deploy", "svc:platform"] } }
+    },
+    {
+      "name": "production-deploy-only",
+      "match": { "refs": ["refs/heads/production", "refs/heads/production/**"] },
+      "effect": { "protect": { "bypass": ["svc:deploy"] } }
+    }
+  ]
+}"#;
+
+    fn baseline_example() -> RepoPolicy {
+        parse_bytes(BASELINE_EXAMPLE.as_bytes()).unwrap()
+    }
+
+    /// One update per op on `name`, judged alone (non-atomic): `Ok` or the reason.
+    fn verdicts(
+        baseline: Option<&RepoPolicy>,
+        repo: &RepoPolicy,
+        who: &str,
+        name: &str,
+    ) -> Vec<Result<(), String>> {
+        // create, fast-forward update, force update, delete
+        let cases = [
+            ("", "bbb", false),
+            ("aaa", "bbb", false),
+            ("aaa", "ccc", true),
+            ("aaa", "", false),
+        ];
+        cases
+            .iter()
+            .map(|(old, new, force)| {
+                let t = txn(vec![upd(name, old, new)], false);
+                let ev = evaluate(baseline, repo, who, &t, |_| *force);
+                ev.per_ref[0].1.clone()
+            })
+            .collect()
+    }
+
+    fn all_ok(v: &[Result<(), String>]) -> bool {
+        v.iter().all(Result::is_ok)
+    }
+
+    fn all_denied_by(v: &[Result<(), String>], reason: &str) -> bool {
+        v.iter()
+            .all(|r| r.as_ref().err().is_some_and(|e| e == reason))
+    }
+
+    #[test]
+    fn baseline_example_is_the_documented_one() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let doc = include_str!("../../../docs/POLICY.md");
+        assert!(
+            squash(doc).contains(&squash(BASELINE_EXAMPLE)),
+            "docs/POLICY.md must carry BASELINE_EXAMPLE verbatim"
+        );
+    }
+
+    #[test]
+    fn baseline_example_reserves_everything_but_sandboxes() {
+        let b = baseline_example();
+        let none = RepoPolicy::empty();
+        let reserved = "rejected by baseline rule 'reserve-heads-and-tags'";
+        let deploy_only = "rejected by baseline rule 'production-deploy-only'";
+        let member = "bob@example.com";
+        // Members: every op in the two sandboxes, nothing else under heads/tags.
+        for r in ["refs/heads/draft/x", "refs/heads/explore/a/b"] {
+            assert!(all_ok(&verdicts(Some(&b), &none, member, r)), "{r}");
+        }
+        for r in [
+            "refs/heads/main",
+            "refs/heads/draft",
+            "refs/heads/drafts/x",
+            "refs/tags/v1",
+            "refs/heads/production",
+            "refs/heads/production/eu",
+        ] {
+            // The first denying rule is named: the reservation, for production too.
+            assert!(
+                all_denied_by(&verdicts(Some(&b), &none, member, r), reserved),
+                "{r}"
+            );
+        }
+        // Outside refs/heads and refs/tags the baseline says nothing.
+        assert!(all_ok(&verdicts(
+            Some(&b),
+            &none,
+            member,
+            "refs/notes/commits"
+        )));
+        // The deploy robot: everything, production included.
+        for r in [
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/heads/production",
+            "refs/heads/production/eu",
+            "refs/heads/draft/x",
+        ] {
+            assert!(all_ok(&verdicts(Some(&b), &none, "svc:deploy", r)), "{r}");
+        }
+        // The platform robot: everything but production (AND: it bypasses the
+        // reservation, not the production rule).
+        for r in ["refs/heads/main", "refs/tags/v1", "refs/heads/release/2"] {
+            assert!(all_ok(&verdicts(Some(&b), &none, "svc:platform", r)), "{r}");
+        }
+        for r in ["refs/heads/production", "refs/heads/production/eu"] {
+            assert!(
+                all_denied_by(&verdicts(Some(&b), &none, "svc:platform", r), deploy_only),
+                "{r}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_policy_adds_to_the_baseline_never_lifts_it() {
+        let b = baseline_example();
+        let reserved = "rejected by baseline rule 'reserve-heads-and-tags'";
+        // An empty own document (what `PUT {}` or a fresh policy.json looks like)
+        // does not drop the host's protection.
+        let empty = parse_bytes(br#"{"version": 1, "rules": []}"#).unwrap();
+        assert!(all_denied_by(
+            &verdicts(Some(&b), &empty, "bob@example.com", "refs/heads/main"),
+            reserved
+        ));
+        // A repository rule restricts further inside a sandbox; its denials name it
+        // as a repository rule.
+        let own = parse_bytes(
+            br#"{
+              "version": 1,
+              "rules": [{
+                "name": "freeze-draft-release",
+                "match": { "refs": ["refs/heads/draft/release"] },
+                "effect": { "protect": { "restricts": ["update", "delete", "force-push"], "bypass": ["alice@example.com"] } }
+              }]
+            }"#,
+        )
+        .unwrap();
+        let v = verdicts(
+            Some(&b),
+            &own,
+            "bob@example.com",
+            "refs/heads/draft/release",
+        );
+        assert!(
+            v[0].is_ok(),
+            "create is not restricted by the repository rule"
+        );
+        assert!(
+            v[1..]
+                .iter()
+                .all(|r| r.as_ref().unwrap_err() == "rejected by rule 'freeze-draft-release'")
+        );
+        assert!(all_ok(&verdicts(
+            Some(&b),
+            &own,
+            "alice@example.com",
+            "refs/heads/draft/release"
+        )));
+        assert!(all_ok(&verdicts(
+            Some(&b),
+            &own,
+            "bob@example.com",
+            "refs/heads/draft/other"
+        )));
+        // Both deny: the baseline rule is named (evaluation order), the verdict is the same.
+        let wide = parse_bytes(
+            br#"{"version": 1, "rules": [{"name": "lock-main", "match": {"refs": ["refs/heads/main"]}, "effect": {"protect": {}}}]}"#,
+        )
+        .unwrap();
+        assert!(all_denied_by(
+            &verdicts(Some(&b), &wide, "bob@example.com", "refs/heads/main"),
+            reserved
+        ));
+        // … and a robot the baseline admits is still held by the repository's rule.
+        assert!(all_denied_by(
+            &verdicts(Some(&b), &wide, "svc:deploy", "refs/heads/main"),
+            "rejected by rule 'lock-main'"
+        ));
+        // Without a baseline the repository document is the whole policy.
+        assert!(all_ok(&verdicts(
+            None,
+            &empty,
+            "bob@example.com",
+            "refs/heads/main"
+        )));
+    }
+
+    #[test]
+    fn rosters_do_not_cross_documents() {
+        let b = parse_bytes(
+            br#"{
+              "version": 1,
+              "groups": [{ "name": "deployers", "members": ["svc:deploy"] }],
+              "rules": [{
+                "name": "production",
+                "match": { "refs": ["refs/heads/production"] },
+                "effect": { "protect": { "bypass": ["group:deployers"] } }
+              }]
+            }"#,
+        )
+        .unwrap();
+        // A repository that defines a group of the same name does not join it.
+        let own = parse_bytes(
+            br#"{"version": 1, "groups": [{ "name": "deployers", "members": ["alice@example.com"] }], "rules": []}"#,
+        )
+        .unwrap();
+        assert!(all_denied_by(
+            &verdicts(Some(&b), &own, "alice@example.com", "refs/heads/production"),
+            "rejected by baseline rule 'production'"
+        ));
+        assert!(all_ok(&verdicts(
+            Some(&b),
+            &own,
+            "svc:deploy",
+            "refs/heads/production"
+        )));
+    }
+
+    #[test]
+    fn baseline_uses_the_policy_json_validator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = walgit_config::Config::default();
+        assert!(load_baseline(&cfg).unwrap().is_none());
+        let path = dir.path().join("baseline.json");
+        cfg.policy.baseline = Some(path.clone());
+        let e = load_baseline(&cfg).unwrap_err().to_string();
+        assert!(e.contains("reading policy.baseline"), "{e}");
+        std::fs::write(&path, BASELINE_EXAMPLE).unwrap();
+        assert_eq!(load_baseline(&cfg).unwrap(), Some(baseline_example()));
+        // Every refusal of the policy.json parser refuses the baseline too.
+        for bad in [
+            "not json",
+            r#"{"version": 2, "rules": []}"#,
+            r#"{"version": 1, "rules": [{"name": "x", "bypass_actrs": [], "match": {}, "effect": {"protect": {}}}]}"#,
+            r#"{"version": 1, "rules": [{"name": "x", "match": {}, "effect": {"protect": {"restricts": []}}}]}"#,
+            r#"{"version": 1, "rules": [
+                {"name": "a", "match": {"refs": ["refs/heads/main"]}, "effect": {"protect": {"bypass": ["alice@example.com"]}}},
+                {"name": "b", "match": {"refs": ["refs/heads/main"]}, "effect": {"protect": {"bypass": ["bob@example.com"]}}}
+            ]}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let e = load_baseline(&cfg).unwrap_err().to_string();
+            assert!(e.starts_with("policy.baseline "), "{bad}: {e}");
+        }
     }
 
     #[test]
