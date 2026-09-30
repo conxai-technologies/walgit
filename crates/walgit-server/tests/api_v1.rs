@@ -1350,3 +1350,151 @@ async fn default_branch_is_chosen_at_creation_healed_by_push_and_moved_by_admin(
     assert_eq!(st, 404);
     Ok(())
 }
+
+/// D50 × D51 × D52 × D53: `proxy` mode's owner scope covers the routes the other topics
+/// added. Repository-prefixed ones (`…/api/description`, `…/api/head`,
+/// `…/api/policy/effective`, create with `?description=` / `?default_branch=`) through the
+/// shared route layer; the owner profile (`/api[-browser]/v1/owners/{owner}`, no `{repo}`)
+/// in its handlers — 404 on every method, like a repository that does not exist. The
+/// `?detail=1` owner listings are built from the scope-filtered list, so an out-of-scope
+/// owner's profile and descriptions never appear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_owner_scope_covers_metadata_head_and_policy_routes() -> TestResult {
+    use reqwest::Method;
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Proxy;
+        c.server.auth.anonymous_read = false;
+    })
+    .await?;
+    let as_ = |access: &'static str, owners: Option<&'static str>| {
+        let mut h = vec![
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", access),
+        ];
+        if let Some(o) = owners {
+            h.push(("X-Walgit-Owners", o));
+        }
+        h
+    };
+    let unscoped = as_("admin", None);
+    for path in ["/acme/app/api", "/other/app/api"] {
+        let (st, text, _) = req(&server, Method::PUT, path, &unscoped).await?;
+        assert_eq!(st, 201, "{path}: {text}");
+    }
+    // Labels on both owners, written without a scope.
+    for (path, body) in [
+        ("/api/v1/owners/acme", r#"{"display_name":"Acme"}"#),
+        ("/api/v1/owners/other", r#"{"display_name":"Other"}"#),
+        ("/acme/app/api/description", r#"{"description":"acme app"}"#),
+        (
+            "/other/app/api/description",
+            r#"{"description":"other app"}"#,
+        ),
+    ] {
+        let (st, text) = req_body(&server, Method::PUT, path, &unscoped, body).await?;
+        assert_eq!(st, 204, "PUT {path}: {text}");
+    }
+
+    let scoped = as_("admin", Some("acme"));
+    let json = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+    // Detail listings: only in-scope owners, and nothing from out-of-scope ones.
+    let (st, text, _) = req(&server, Method::GET, "/api/v1/owners?detail=1", &scoped).await?;
+    assert_eq!(st, 200);
+    assert_eq!(
+        json(&text),
+        serde_json::json!([{"name": "acme", "display_name": "Acme"}])
+    );
+    for lane in ["/api/v1", "/api-browser/v1"] {
+        let path = format!("{lane}/owners/other/repos?detail=1");
+        let (st, text, _) = req(&server, Method::GET, &path, &scoped).await?;
+        assert_eq!((st.as_u16(), text.as_str()), (200, "[]"), "{path}");
+    }
+    let (_, text, _) = req(
+        &server,
+        Method::GET,
+        "/api/v1/owners/acme/repos?detail=1",
+        &scoped,
+    )
+    .await?;
+    assert_eq!(
+        json(&text),
+        serde_json::json!([{"name": "app", "description": "acme app"}])
+    );
+
+    // Owner profile: 404 for every method out of scope, served in scope.
+    for (method, path) in [
+        (Method::GET, "/api/v1/owners/other"),
+        (Method::GET, "/api-browser/v1/owners/other"),
+        (Method::DELETE, "/api/v1/owners/other"),
+    ] {
+        let (st, text, _) = req(&server, method.clone(), path, &scoped).await?;
+        assert_eq!(st, 404, "{method} {path} is out of scope: {text}");
+    }
+    let (st, text) = req_body(
+        &server,
+        Method::PUT,
+        "/api/v1/owners/other",
+        &scoped,
+        r#"{"display_name":"Hijacked"}"#,
+    )
+    .await?;
+    assert_eq!(st, 404, "PUT out of scope: {text}");
+    let (st, text, _) = req(&server, Method::GET, "/api/v1/owners/acme", &scoped).await?;
+    assert_eq!(st, 200);
+    assert_eq!(json(&text)["display_name"], "Acme");
+
+    // Repository routes added by metadata, default-head and default-policy.
+    for (method, path) in [
+        (Method::GET, "/other/app/api/description"),
+        (Method::DELETE, "/other/app/api/description"),
+        (Method::GET, "/other/app/api/policy/effective"),
+        (Method::GET, "/other/app/api-browser/policy/effective"),
+        (Method::PUT, "/other/fresh/api?description=x"),
+        (Method::PUT, "/other/fresh/api?default_branch=dev"),
+    ] {
+        let (st, text, _) = req(&server, method.clone(), path, &scoped).await?;
+        assert_eq!(st, 404, "{method} {path} is out of scope: {text}");
+    }
+    for (path, body) in [
+        (
+            "/other/app/api/description",
+            r#"{"description":"hijacked"}"#,
+        ),
+        ("/other/app/api/head", r#"{"branch":"main"}"#),
+    ] {
+        let (st, text) = req_body(&server, Method::PUT, path, &scoped, body).await?;
+        assert_eq!(st, 404, "PUT {path} is out of scope: {text}");
+    }
+    // In scope the same routes answer on their merits.
+    let (st, text, _) = req(
+        &server,
+        Method::GET,
+        "/acme/app/api/policy/effective",
+        &scoped,
+    )
+    .await?;
+    assert_eq!(st, 200, "{text}");
+    assert_eq!(json(&text)["layers"][0]["source"], "repository");
+    let (st, text) = req_body(
+        &server,
+        Method::PUT,
+        "/acme/app/api/head",
+        &scoped,
+        r#"{"branch":"nope"}"#,
+    )
+    .await?;
+    assert_eq!(st, 409, "no such branch in scope: {text}");
+
+    // Nothing out of scope was changed.
+    let (_, text, _) = req(&server, Method::GET, "/api/v1/owners/other", &unscoped).await?;
+    assert_eq!(json(&text)["display_name"], "Other");
+    let (_, text, _) = req(
+        &server,
+        Method::GET,
+        "/other/app/api/description",
+        &unscoped,
+    )
+    .await?;
+    assert_eq!(json(&text)["description"], "other app");
+    Ok(())
+}

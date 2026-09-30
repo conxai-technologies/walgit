@@ -374,8 +374,9 @@ pub async fn http_get_profile(
     owner: &str,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_read(headers).await.map_err(auth_err)?;
     owner_arg(owner)?;
+    in_scope(&principal, owner)?;
     let profile = load_profile(&st.store, owner).await.map_err(store_err)?;
     let entry = OwnerEntry {
         name: owner.to_string(),
@@ -392,8 +393,9 @@ pub async fn http_put_profile(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
     owner_arg(owner)?;
+    in_scope(&principal, owner)?;
     let bytes = read_body(body).await?;
     let profile = parse_profile(owner, &bytes).map_err(ApiError::BadRequest)?;
     save_profile(&st.store, owner, &profile)
@@ -408,10 +410,22 @@ pub async fn http_delete_profile(
     owner: &str,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_admin(headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
     owner_arg(owner)?;
+    in_scope(&principal, owner)?;
     clear_profile(&st.store, owner).await.map_err(store_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
+}
+
+/// `proxy` mode's owner scope (D50) for the owner-level routes: `owners/{o}` carries no
+/// `{repo}` parameter, so `web::owner_scope` does not see it. An owner outside the scope
+/// answers the same 404 as a repository that does not exist, for every method.
+fn in_scope(principal: &crate::auth::Principal, owner: &str) -> Result<(), ApiError> {
+    if principal.sees_owner(owner) {
+        Ok(())
+    } else {
+        Err(crate::web::out_of_scope())
+    }
 }
 
 /// Bounded body read: 413 above `MAX_DOCUMENT_BYTES` without buffering more than that.

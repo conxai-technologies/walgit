@@ -508,7 +508,8 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   `X-Walgit-*` identity headers clients send. The owner scope is a listing filter and a second wall — the proxy
   still decides per repository — and answers like absence (404, `[]`) so it confirms nothing beyond itself.
   Scope checks run once over all matched `{owner}/{repo}` routes (`web::owner_scope` as a `route_layer`) and
-  in `dispatch_route` for the fallback (git, LFS), so a new repository route inherits them. The principal name
+  in `dispatch_route` for the fallback (git, LFS), so a new repository route inherits them; owner-level routes
+  without `{repo}` (the D51 owner profile) check it in their handlers. The principal name
   is what `policy.json`, logs and push attribution see, as in every mode. A push broker behind proxy-mode
   fronts keeps `token` mode (`trusted_forwarders`): the hop is walgit-to-walgit, not through the proxy.
 

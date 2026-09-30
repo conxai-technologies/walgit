@@ -273,6 +273,7 @@ a body above 8 KiB `413`. Stored at `owners/<owner>/profile.json` in the bucket 
 Writing a profile for an owner without repositories is allowed (an operator can name an owner
 before its first repository); it is listed once a repository exists. Cache: SWR + body-digest
 `ETag`. Also on the browser lane (`/api-browser/v1/owners/{owner}`, like every `owners*` route).
+An owner outside the caller's scope (`proxy` mode's `X-Walgit-Owners`) answers `404` on every method.
 
 ### `GET /api/v1/me`
 
