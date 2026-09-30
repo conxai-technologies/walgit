@@ -631,3 +631,195 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
     assert_eq!(st, 200, "{text}");
     Ok(())
 }
+
+/// D50: behind an identity-aware proxy (`server.auth.mode = "proxy"`, loopback: the
+/// sidecar shape, no secret) identity and access come only from the proxy's headers,
+/// and `X-Walgit-Owners` narrows what exists: listings omit other owners and every
+/// route under their prefix — JSON API in both lanes, repo admin, UI data, git smart
+/// HTTP — answers the 404 of a repository that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_mode_takes_identity_access_and_owner_scope_from_the_proxy() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Proxy;
+        c.server.auth.anonymous_read = false;
+    })
+    .await?;
+    let as_ = |access: &'static str, owners: Option<&'static str>| {
+        let mut h = vec![
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", access),
+        ];
+        if let Some(o) = owners {
+            h.push(("X-Walgit-Owners", o));
+        }
+        h
+    };
+    for path in ["/acme/app/api", "/other/app/api"] {
+        let (st, text, _) = req(&server, reqwest::Method::PUT, path, &as_("write", None)).await?;
+        assert_eq!(st, 201, "{path}: {text}");
+    }
+
+    // No principal: 401; no or an unknown access level: 403; read cannot write.
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/api/v1/owners", &[])
+            .await?
+            .0,
+        401
+    );
+    let nameless = [("X-Walgit-Access", "admin")];
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/acme/app/api", &nameless)
+            .await?
+            .0,
+        401
+    );
+    let levelless = [("X-Walgit-Principal", "dev@example.com")];
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/acme/app/api", &levelless)
+            .await?
+            .0,
+        403
+    );
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::PUT,
+            "/acme/new/api",
+            &as_("read", None)
+        )
+        .await?
+        .0,
+        403
+    );
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::DELETE,
+            "/acme/app/api",
+            &as_("write", None)
+        )
+        .await?
+        .0,
+        403,
+        "write is push, not admin"
+    );
+    let (st, me, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/me",
+        &as_("read", None),
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&me)?["principal"],
+        "dev@example.com"
+    );
+
+    // Absent or `*`: every owner.
+    for owners in [None, Some("*")] {
+        let (_, text, _) = req(
+            &server,
+            reqwest::Method::GET,
+            "/api/v1/owners",
+            &as_("read", owners),
+        )
+        .await?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&text)?,
+            serde_json::json!(["acme", "other"])
+        );
+    }
+
+    let scoped = as_("admin", Some("acme"));
+    for path in ["/api/v1/owners", "/services/api/owners"] {
+        let (st, text, _) = req(&server, reqwest::Method::GET, path, &scoped).await?;
+        assert_eq!(st, 200, "{path}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text)?,
+            serde_json::json!(["acme"]),
+            "{path}"
+        );
+    }
+    for path in ["/api/v1/owners/other/repos", "/services/api/owners/other"] {
+        let (st, text, _) = req(&server, reqwest::Method::GET, path, &scoped).await?;
+        assert_eq!(
+            (st.as_u16(), text.as_str()),
+            (200, "[]"),
+            "{path}: lists like an unknown owner"
+        );
+    }
+    let (_, text, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/owners/acme/repos",
+        &scoped,
+    )
+    .await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&text)?,
+        serde_json::json!(["app"])
+    );
+
+    for (method, path) in [
+        (reqwest::Method::GET, "/other/app/api"),
+        (reqwest::Method::GET, "/other/app/api-browser"),
+        (reqwest::Method::GET, "/other/app/api/refs"),
+        (reqwest::Method::GET, "/other/app/api/overview"),
+        (reqwest::Method::GET, "/other/app/api/settings"),
+        (reqwest::Method::GET, "/other/app/api/policy"),
+        (
+            reqwest::Method::GET,
+            "/other/app.git/info/refs?service=git-upload-pack",
+        ),
+        (
+            reqwest::Method::POST,
+            "/other/app.git/info/lfs/objects/batch",
+        ),
+        (reqwest::Method::DELETE, "/other/app/api"),
+        (reqwest::Method::PUT, "/other/fresh/api"),
+    ] {
+        let (st, text, _) = req(&server, method.clone(), path, &scoped).await?;
+        assert_eq!(st, 404, "{method} {path} is out of scope: {text}");
+    }
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::GET,
+            "/other/app/api",
+            &as_("admin", Some(""))
+        )
+        .await?
+        .0,
+        404,
+        "an empty owner list is the empty scope"
+    );
+    // In scope, the same caller is served; the out-of-scope repository is intact.
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/acme/app/api", &scoped)
+            .await?
+            .0,
+        200
+    );
+    let (st, _, h) = req(
+        &server,
+        reqwest::Method::GET,
+        "/acme/app.git/info/refs?service=git-upload-pack",
+        &scoped,
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert!(hdr(&h, "content-type").contains("git-upload-pack"));
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::GET,
+            "/other/app/api",
+            &as_("read", None)
+        )
+        .await?
+        .0,
+        200
+    );
+    Ok(())
+}
