@@ -1418,8 +1418,13 @@ mod tests {
 
     #[test]
     fn example_configurations_parse_and_validate() {
-        Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
+        let example = Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
         Config::parse(include_str!("../../../walgit.standalone.toml")).unwrap();
+        // The example documents defaults; `[store.s3]` once showed AWS values instead.
+        assert_eq!(
+            toml::to_string(&example.store.s3).unwrap(),
+            toml::to_string(&S3Config::default()).unwrap()
+        );
     }
 
     #[test]
