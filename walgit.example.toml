@@ -2,7 +2,8 @@
 #
 # Start from walgit.standalone.toml for a first run; come here when you need a key.
 # Every key can also be set from the environment: WALGIT__SECTION__KEY=value (TOML value syntax).
-# Validate with: walgit --config walgit.toml config check
+# An override this build cannot apply (unknown key, wrong type) is a startup error, like an unknown key here.
+# Validate with: walgit --config walgit.toml config check [--env-file host.env]
 
 [server]
 listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
