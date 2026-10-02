@@ -44,6 +44,8 @@ mode = "none"                     # "none" | "token" | "oidc"
                                   #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
 anonymous_read = true             # must be false in oidc mode
 # tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
+#                                 #   (trimmed: a trailing newline from a secret file is fine). A trusted forwarder's
+#                                 #   write/admin bits are the ceiling of what it may grant the users it names.
 #   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
 #   { principal = "ci", token = "literal-secret", write = false },
 # ]
@@ -61,7 +63,12 @@ anonymous_read = true             # must be false in oidc mode
 # access_token_ttl = "90d"                 # lifetime of tokens minted at /_auth/tokens
 # audiences = []                           # oidc: `aud` values accepted on bearer ID tokens clients mint themselves;
 #                                          #       the configured web client is always accepted
-# trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
+# trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker,
+#                                          # or a gateway/sidecar that verified the user). Per request such a forwarder may
+#                                          # also narrow, never widen: X-Walgit-Access read|write|admin (clamped to its own
+#                                          # token's bits; admin also from admin_*) and X-Walgit-Owners o1,o2|* (other owners
+#                                          # 404). Those headers from anyone else, or a forwarder whose token fails, = 403
+#                                          # naming the forwarder (never 401: git would drop the user's stored credential).
 
 [store]
 backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)

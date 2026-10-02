@@ -58,6 +58,17 @@ pub async fn info_refs(
             e,
             crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
         );
+        // A forwarder walgit cannot take as meant: nothing the client holds can fix it, and
+        // the client's own credential usually never reached walgit — say so in band.
+        if is_git_client(headers)
+            && !service_param.is_empty()
+            && matches!(e, crate::auth::AuthError::UntrustedForwarder)
+        {
+            return Ok(git_err_response(
+                &service_param,
+                &format!("walgit: {}", crate::error::UNTRUSTED_FORWARDER_MESSAGE),
+            ));
+        }
         if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help {
             return Ok(git_err_response(
                 &service_param,
@@ -1461,6 +1472,9 @@ pub(crate) fn auth_help_message(
         .to_string();
     let why = match e {
         crate::auth::AuthError::Forbidden => "your identity is not allowed to access this host",
+        crate::auth::AuthError::UntrustedForwarder => {
+            "the gateway in front of this host was not accepted as a forwarder (misconfigured gateway)"
+        }
         crate::auth::AuthError::Unavailable => {
             "the token verifier is temporarily unavailable; retry"
         }
@@ -1565,6 +1579,7 @@ pub(crate) fn auth_err(e: crate::auth::AuthError) -> ApiError {
             ApiError::Unauthorized
         }
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::UntrustedForwarder => ApiError::UntrustedForwarder,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

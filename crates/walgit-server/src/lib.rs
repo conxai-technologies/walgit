@@ -205,6 +205,12 @@ pub fn router(state: Arc<AppState>) -> Router {
                 },
             ),
         )
+        // Owner scope (a trusted forwarder's `X-Walgit-Owners`) on every repository-prefixed
+        // route registered above.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            web::owner_scope,
+        ))
         .fallback(dispatch)
         // Sliding browser sessions: re-issue a session cookie older than ttl/4.
         .layer(axum::middleware::from_fn_with_state(
@@ -360,6 +366,10 @@ pub(crate) async fn dispatch_route(
     body: Body,
     peer: Option<SocketAddr>,
 ) -> Response {
+    // Owner scope: an owner outside it has no repositories to answer for.
+    if st.auth.hides_owner(&headers, route.id.owner()).await {
+        return web::out_of_scope().into_response();
+    }
     let mut body = Some(body);
     let sub = route.subpath.as_str();
     let result: Result<Response, ApiError> = async {

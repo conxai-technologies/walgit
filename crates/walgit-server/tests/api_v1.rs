@@ -631,3 +631,285 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
     assert_eq!(st, 200, "{text}");
     Ok(())
 }
+
+/// D50: a gateway that verified the user vouches for it with its own `trusted_forwarders`
+/// token (no new auth mode). The token is the ceiling; `X-Walgit-Access` narrows per
+/// request and `X-Walgit-Owners` narrows what exists: listings omit other owners and every
+/// route under their prefix — JSON API in both lanes, repo admin, UI data, git smart HTTP,
+/// LFS — answers the 404 of a repository that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_forwarder_narrows_access_and_owners_below_its_own_token() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "gw".into(),
+            // As a Kubernetes Secret often holds it.
+            token: "gw-token\n".into(),
+            token_env: None,
+            write: true,
+            admin: true,
+        }];
+        c.server.auth.trusted_forwarders = vec!["gw".into()];
+    })
+    .await?;
+    let as_ = |access: &'static str, owners: Option<&'static str>| {
+        let mut h = vec![
+            ("Authorization", "Bearer gw-token"),
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", access),
+        ];
+        if let Some(o) = owners {
+            h.push(("X-Walgit-Owners", o));
+        }
+        h
+    };
+    for path in ["/acme/app/api", "/other/app/api"] {
+        let (st, text, _) = req(&server, reqwest::Method::PUT, path, &as_("write", None)).await?;
+        assert_eq!(st, 201, "{path}: {text}");
+    }
+    let (st, me, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/me",
+        &as_("read", None),
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&me)?["principal"],
+        "dev@example.com"
+    );
+    // Read cannot create; write cannot delete; admin (within the token's ceiling) can.
+    let (st, _, _) = req(
+        &server,
+        reqwest::Method::PUT,
+        "/acme/new/api",
+        &as_("read", None),
+    )
+    .await?;
+    assert_eq!(st, 403);
+    let (st, _, _) = req(
+        &server,
+        reqwest::Method::DELETE,
+        "/acme/app/api",
+        &as_("write", None),
+    )
+    .await?;
+    assert_eq!(st, 403, "write is push, not admin");
+    let (st, text, _) = req(
+        &server,
+        reqwest::Method::PUT,
+        "/acme/tmp/api",
+        &as_("write", None),
+    )
+    .await?;
+    assert_eq!(st, 201, "{text}");
+    let (st, text, _) = req(
+        &server,
+        reqwest::Method::DELETE,
+        "/acme/tmp/api",
+        &as_("admin", None),
+    )
+    .await?;
+    assert!(st.is_success(), "{st}: {text}");
+
+    let scoped = as_("admin", Some("acme"));
+    for path in ["/api/v1/owners", "/services/api/owners"] {
+        let (st, text, _) = req(&server, reqwest::Method::GET, path, &scoped).await?;
+        assert_eq!(st, 200, "{path}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text)?,
+            serde_json::json!(["acme"]),
+            "{path}"
+        );
+    }
+    for path in ["/api/v1/owners/other/repos", "/services/api/owners/other"] {
+        let (st, text, _) = req(&server, reqwest::Method::GET, path, &scoped).await?;
+        assert_eq!((st.as_u16(), text.as_str()), (200, "[]"), "{path}");
+    }
+    for (method, path) in [
+        (reqwest::Method::GET, "/other/app/api"),
+        (reqwest::Method::GET, "/other/app/api-browser"),
+        (reqwest::Method::GET, "/other/app/api/refs"),
+        (reqwest::Method::GET, "/other/app/api/settings"),
+        (reqwest::Method::GET, "/other/app/api/policy"),
+        (
+            reqwest::Method::GET,
+            "/other/app.git/info/refs?service=git-upload-pack",
+        ),
+        (
+            reqwest::Method::POST,
+            "/other/app.git/info/lfs/objects/batch",
+        ),
+        (reqwest::Method::DELETE, "/other/app/api"),
+        (reqwest::Method::PUT, "/other/fresh/api"),
+    ] {
+        let (st, text, _) = req(&server, method.clone(), path, &scoped).await?;
+        assert_eq!(st, 404, "{method} {path} is out of scope: {text}");
+    }
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/acme/app/api", &scoped)
+            .await?
+            .0,
+        200
+    );
+    let (st, _, h) = req(
+        &server,
+        reqwest::Method::GET,
+        "/acme/app.git/info/refs?service=git-upload-pack",
+        &scoped,
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert!(hdr(&h, "content-type").contains("git-upload-pack"));
+    // The out-of-scope repository is intact for a caller without the scope.
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::GET,
+            "/other/app/api",
+            &as_("read", None)
+        )
+        .await?
+        .0,
+        200
+    );
+    // Without the forwarding headers the gateway is itself (its own token), as before.
+    let (_, me, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/me",
+        &[("Authorization", "Bearer gw-token")],
+    )
+    .await?;
+    assert_eq!(serde_json::from_str::<Value>(&me)?["principal"], "gw");
+    Ok(())
+}
+
+/// A forwarded request whose forwarder credential is wrong or missing, or narrowing headers
+/// from a caller that cannot narrow, is the gateway's misconfiguration: a 403 that names the
+/// forwarder, without `WWW-Authenticate`, never a 401 (git erases the stored credential on
+/// one). A git client is told in band. Not forwarding, a dead credential is still a 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_misconfigured_forwarder_is_a_403_naming_it_never_a_401() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "gw".into(),
+                token: "gw-token".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+            walgit_config::StaticToken {
+                principal: "robot".into(),
+                token: "robot-token".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+        ];
+        c.server.auth.trusted_forwarders = vec!["gw".into()];
+    })
+    .await?;
+    let gw = [
+        ("Authorization", "Bearer gw-token"),
+        ("X-Walgit-Principal", "dev@example.com"),
+        ("X-Walgit-Access", "write"),
+    ];
+    let (st, text, _) = req(&server, reqwest::Method::PUT, "/acme/app/api", &gw).await?;
+    assert_eq!(st, 201, "{text}");
+
+    let bad: [&[(&str, &str)]; 4] = [
+        // a stale forwarder token
+        &[
+            ("Authorization", "Bearer stale"),
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", "read"),
+        ],
+        // no forwarder token at all
+        &[
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", "read"),
+        ],
+        // a valid token that is not a trusted forwarder, narrowing
+        &[
+            ("Authorization", "Bearer robot-token"),
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", "read"),
+        ],
+        // a trusted forwarder sending an unknown level
+        &[
+            ("Authorization", "Bearer gw-token"),
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", "owner"),
+        ],
+    ];
+    for headers in bad {
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/v1/owners"),
+            (reqwest::Method::GET, "/acme/app/api"),
+            (
+                reqwest::Method::GET,
+                "/acme/app.git/info/refs?service=git-upload-pack",
+            ),
+            (reqwest::Method::GET, "/_auth/check"),
+        ] {
+            let (st, text, h) = req(&server, method.clone(), path, headers).await?;
+            assert_ne!(st, 401, "{headers:?} {method} {path}: {text}");
+            assert_eq!(st, 403, "{headers:?} {method} {path}: {text}");
+            assert!(
+                text.contains("forwarder"),
+                "{headers:?} {method} {path}: {text}"
+            );
+            assert!(
+                h.get("www-authenticate").is_none(),
+                "{headers:?} {method} {path}"
+            );
+        }
+        // LFS (the batch body is parsed first, so send a valid one).
+        let (st, text) = req_body(
+            &server,
+            reqwest::Method::POST,
+            "/acme/app.git/info/lfs/objects/batch",
+            headers,
+            r#"{"operation":"download","objects":[]}"#,
+        )
+        .await?;
+        assert_eq!(
+            (st.as_u16(), text.contains("forwarder")),
+            (403, true),
+            "{headers:?} lfs: {text}"
+        );
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let mut h = headers.to_vec();
+            h.push(("User-Agent", "git/2.46.0"));
+            let (st, text, _) = req(
+                &server,
+                reqwest::Method::GET,
+                &format!("/acme/app.git/info/refs?service={service}"),
+                &h,
+            )
+            .await?;
+            assert_ne!(st, 401, "{headers:?} {service}: {text}");
+            assert!(
+                text.contains("ERR walgit: forbidden") && text.contains("forwarder"),
+                "{headers:?} {service}: {text}"
+            );
+        }
+    }
+    // Not forwarding: a dead credential is still a real 401 (git erases it and asks again).
+    let (st, _, h) = req(
+        &server,
+        reqwest::Method::GET,
+        "/acme/app/api",
+        &[("Authorization", "Bearer stale")],
+    )
+    .await?;
+    assert_eq!(st, 401);
+    assert!(h.get("www-authenticate").is_some());
+    Ok(())
+}

@@ -164,8 +164,10 @@ pub struct AuthConfig {
     /// Domains permitted to write. If unset, all allowed domains may write.
     pub write_domains: Option<Vec<String>>,
     /// Principals allowed to forward an end-user identity (`X-Walgit-Principal`) to this
-    /// server — the host that fronts a push broker. Names as they authenticate here (a static
-    /// token's `principal`, or an email).
+    /// server — the host that fronts a push broker, or a gateway/sidecar that verified the
+    /// user itself. Names as they authenticate here (a static token's `principal`, or an
+    /// email). The forwarder's own `write`/`admin` are the ceiling: per request it may narrow
+    /// the user's access (`X-Walgit-Access`) and owners (`X-Walgit-Owners`), never widen.
     pub trusted_forwarders: Vec<String>,
     /// OIDC emails that may PUT/DELETE settings and `policy.json`. Empty = none via email.
     #[serde(default)]
@@ -214,7 +216,7 @@ pub enum AuthMode {
 #[serde(deny_unknown_fields)]
 pub struct StaticToken {
     pub principal: String,
-    /// Read from env var if set, else literal.
+    /// Read from env var if set, else literal; surrounding whitespace is trimmed.
     #[serde(default)]
     pub token: String,
     #[serde(default)]

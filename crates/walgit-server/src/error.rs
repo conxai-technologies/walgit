@@ -6,12 +6,22 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+/// Body of [`ApiError::UntrustedForwarder`] (and of the in-band git `ERR` for it).
+pub const UNTRUSTED_FORWARDER_MESSAGE: &str = "forbidden: walgit did not accept the forwarder in front of it \
+     (its token is invalid, missing or not in trusted_forwarders, or it sent a repeated or malformed \
+     X-Walgit-Principal / X-Walgit-Access / X-Walgit-Owners): the gateway is misconfigured, or the request \
+     bypassed it. Your credential was not rejected; the operator must fix the gateway";
+
 #[derive(Debug)]
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
     Unauthorized,
     Forbidden,
+    /// A forwarded request walgit cannot take as meant (`AuthError::UntrustedForwarder`).
+    /// 403, never 401: git erases the client's stored credential on a 401, and the
+    /// credential is not what failed.
+    UntrustedForwarder,
     Conflict(String),
     PayloadTooLarge,
     UnsupportedMediaType(String),
@@ -25,7 +35,7 @@ impl ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
-            ApiError::Forbidden => StatusCode::FORBIDDEN,
+            ApiError::Forbidden | ApiError::UntrustedForwarder => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -43,6 +53,7 @@ impl ApiError {
             ApiError::BadRequest(m) => format!("bad request: {m}"),
             ApiError::Unauthorized => "unauthorized".to_string(),
             ApiError::Forbidden => "forbidden".to_string(),
+            ApiError::UntrustedForwarder => UNTRUSTED_FORWARDER_MESSAGE.to_string(),
             ApiError::Conflict(m) => format!("conflict: {m}"),
             ApiError::PayloadTooLarge => "payload too large".to_string(),
             ApiError::UnsupportedMediaType(m) => format!("unsupported media type: {m}"),

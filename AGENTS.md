@@ -105,6 +105,14 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 - **Host to host**: a front that forwards pushes to a broker presents `wal.push_broker_token` (or
   `WALGIT_BROKER_TOKEN`); the broker lists it in `tokens` and its principal in `trusted_forwarders`, so the end
   user travels in `X-Walgit-Principal`.
+- **Forwarder ceiling** (D50): the same mechanism lets a gateway or sidecar that verified the user vouch for it
+  with its own token. The forwarder's token `write`/`admin` is the ceiling; per request it may narrow with
+  `X-Walgit-Access: read|write|admin` (clamped, never above the token; admin also from `admin_*`; absent = as
+  before) and `X-Walgit-Owners: <o>[,<o>…] | *` (owner listings omit the rest, every route under their prefix
+  answers the 404 of a missing repository, their `…/repos` is `[]`). Those two headers are honoured only from a
+  trusted forwarder naming a user; from anyone else they refuse the request (403) instead of being dropped. A
+  forwarded request whose forwarder credential fails, or a repeated/malformed forwarding header, is a **403
+  naming the forwarder, never a 401** (the user's credential was not presented; a 401 makes git erase it).
 - Tests never write the user's global git config (private `GIT_CONFIG_GLOBAL`, `tests/lib-auth.sh`).
 
 ### 1.4 Requirements (the bar)
@@ -486,6 +494,17 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
+
+- **D50 (2026-10-02): A gateway vouches with its own token; its token is the ceiling.** Deployments that verify
+  identity and decide access at a gateway (JWT verification + an external authorizer) need walgit to take the
+  gateway's per-request verdict. Not a new auth mode (§5: no new auth paths) and not trust by network position
+  or config (D39): the gateway authenticates as a `trusted_forwarders` token on every request, as a push-broker
+  front already does. What that token may do bounds what it may grant: `X-Walgit-Access` only narrows below it,
+  so a compromised or buggy gateway can never exceed its own token. `X-Walgit-Owners` is a listing filter and a
+  second wall, answering like absence (404, `[]`); the gateway still decides per repository. A narrowing header
+  walgit will not honour refuses the request rather than being ignored — ignoring a narrowing widens access.
+  Scope checks run once over all matched `{owner}/{repo}` routes (`web::owner_scope` as a `route_layer`) and in
+  `dispatch_route` for the fallback (git, LFS), and authenticate only when `X-Walgit-Owners` is present.
 
 ## 5. Working rules
 

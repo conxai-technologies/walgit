@@ -1,5 +1,5 @@
 //! Authentication: `none` / `token` / `oidc`. Resolves a request to a
-//! [`Principal`] (name + write bit).
+//! [`Principal`] (name, write/admin bits, owner scope).
 //!
 //! * **`token`** — static tokens from the config, presented as `Authorization:
 //!   Bearer <token>` or as the password of HTTP Basic (any user name).
@@ -19,6 +19,18 @@
 //! hop credential; it then announces `client-authorization` in
 //! `X-Walgit-Capabilities` and carries the client's header in
 //! `X-Walgit-Authorization`. Nothing is inferred from configuration.
+//!
+//! **Forwarding.** A caller that authenticates as one of `trusted_forwarders` (with its
+//! own token, per request) may vouch for an end user in `X-Walgit-Principal` — a front
+//! in front of a push broker, or a gateway/sidecar that verified the user itself. The
+//! forwarder's own token is the **ceiling**: with `X-Walgit-Access: read | write | admin`
+//! it narrows the user's access per request, never above what its token carries (admin
+//! also from walgit's own `admin_*` grants), and with `X-Walgit-Owners: <o>[,<o>…] | *`
+//! it narrows which owners exist for the user. Those two headers are honoured only from
+//! a trusted forwarder that names a user; anywhere else they refuse the request (403)
+//! rather than being dropped, since dropping a narrowing widens access. A forwarder whose
+//! own credential fails is a 403 too, never a 401: the user's credential was not the one
+//! presented, and a 401 is what makes git erase it.
 
 use std::{
     sync::{
@@ -35,6 +47,15 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use walgit_config::{ACCESS_TOKEN_PREFIX, AuthMode, StaticToken};
 
+/// End-user identity asserted by a trusted forwarder (anyone in `none` mode).
+pub const PRINCIPAL_HEADER: &str = "x-walgit-principal";
+/// A trusted forwarder's per-request access for the user it names: `read`, `write`
+/// (implies read) or `admin` (implies write), clamped to the forwarder's own token.
+/// Absent = the forwarder's write bit and walgit's own admin grants, as before.
+pub const FORWARDED_ACCESS_HEADER: &str = "x-walgit-access";
+/// A trusted forwarder's owner scope for the user it names: `<owner>[,<owner>…]` or `*`.
+/// Absent = every owner.
+pub const FORWARDED_OWNERS_HEADER: &str = "x-walgit-owners";
 /// Client `Authorization` as copied by an edge before it replaces that header with its own
 /// hop credential. Read only when the edge announces `client-authorization`.
 pub const FORWARDED_AUTHORIZATION_HEADER: &str = "x-walgit-authorization";
@@ -59,6 +80,9 @@ pub struct Principal {
     /// Independent of `write` (push and repository creation).
     pub admin: bool,
     pub anonymous: bool,
+    /// Owners this principal may address at all ([`OwnerScope::All`] unless a trusted
+    /// forwarder narrowed it with `X-Walgit-Owners`).
+    pub owners: OwnerScope,
 }
 
 impl Principal {
@@ -68,8 +92,67 @@ impl Principal {
             write: false,
             admin: false,
             anonymous: true,
+            owners: OwnerScope::All,
         }
     }
+
+    /// Whether `owner` exists for this principal (listings, and every route under it).
+    pub fn sees_owner(&self, owner: &str) -> bool {
+        self.owners.contains(owner)
+    }
+}
+
+/// The owners a principal may address. Only a trusted forwarder narrows it
+/// (`X-Walgit-Owners`): an owner outside the list does not exist for the caller — listings
+/// omit it and every route under its prefix answers 404, exactly like an owner without
+/// repositories. Never 403: the answer must not confirm that the owner exists. The
+/// forwarder remains the authority for per-repository decisions; this is the listing
+/// filter and a second wall.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OwnerScope {
+    #[default]
+    All,
+    /// Exact (case-sensitive, like the bucket prefix) owner names. Empty = none.
+    Only(Vec<String>),
+}
+
+impl OwnerScope {
+    pub fn contains(&self, owner: &str) -> bool {
+        match self {
+            OwnerScope::All => true,
+            OwnerScope::Only(owners) => owners.iter().any(|o| o == owner),
+        }
+    }
+
+    /// Parse an `X-Walgit-Owners` value: `*`, or comma-separated owner names (blank entries
+    /// skipped, so an empty value is the empty scope). A malformed entry refuses the whole
+    /// header rather than dropping it: guessing which part was meant is how a scope widens.
+    fn parse(value: &str) -> Option<Self> {
+        if value.trim() == "*" {
+            return Some(OwnerScope::All);
+        }
+        let mut owners = Vec::new();
+        for owner in value.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+            // Owner names follow the repository-id rules; the name half is a placeholder.
+            walgit_git::RepoId::new(owner, "_").ok()?;
+            owners.push(owner.to_string());
+        }
+        Some(OwnerScope::Only(owners))
+    }
+}
+
+/// The single value of `name`: `Ok(None)` when absent, `Err` when repeated or not visible
+/// ASCII. A repeated identity header means something between the client and walgit
+/// appended instead of replacing — the request is not trusted to mean either value.
+fn single_header<'h>(headers: &'h HeaderMap, name: &str) -> Result<Option<&'h str>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    first.to_str().map(|v| Some(v.trim())).map_err(|_| ())
 }
 
 /// A JWKS public key: RSA or EC P-256.
@@ -622,30 +705,86 @@ impl Authenticator {
         &self,
         headers: &HeaderMap,
     ) -> Result<Principal, AuthError> {
-        let caller = self.authenticate_inner(headers).await?;
-        let Some(forwarded) = headers
-            .get("x-walgit-principal")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        else {
-            return Ok(caller);
+        let forwarded = single_header(headers, PRINCIPAL_HEADER)
+            .map_err(|()| AuthError::UntrustedForwarder)?
+            .filter(|v| !v.is_empty());
+        // A narrowing the request carries must be applied or the request refused: dropping
+        // it would serve the user with more than the forwarder decided.
+        let narrows = headers.contains_key(FORWARDED_ACCESS_HEADER)
+            || headers.contains_key(FORWARDED_OWNERS_HEADER);
+        let caller = match self.authenticate_inner(headers).await {
+            Ok(caller) => caller,
+            // The forwarder's own credential failed (or is missing). The user's credential
+            // was never presented here, so a 401 — git erases its stored credential on one —
+            // would punish the wrong party.
+            Err(AuthError::Invalid | AuthError::Unauthorized) if forwarded.is_some() || narrows => {
+                tracing::warn!(
+                    "a forwarded request whose forwarder credential was rejected or missing: the gateway in front is misconfigured"
+                );
+                return Err(AuthError::UntrustedForwarder);
+            }
+            Err(e) => return Err(e),
         };
-        if self.mode == AuthMode::None
+        let trusted = self.mode == AuthMode::None
             || (caller.write
                 && self
                     .trusted_forwarders
                     .iter()
-                    .any(|f| f.eq_ignore_ascii_case(&caller.name)))
+                    .any(|f| f.eq_ignore_ascii_case(&caller.name)));
+        let Some(forwarded) = forwarded.filter(|_| trusted) else {
+            if narrows {
+                tracing::warn!(caller = %caller.name, "X-Walgit-Access / X-Walgit-Owners from a caller that is not a trusted forwarder naming a user; refused");
+                return Err(AuthError::UntrustedForwarder);
+            }
+            // An untrusted caller's `X-Walgit-Principal` is ignored: it acts as itself.
+            return Ok(caller);
+        };
+        // The forwarder's token is the ceiling; the header only narrows below it. Admin may
+        // also come from walgit's own grants for the user (`admin_*`, an admin token's
+        // principal), exactly as without the header.
+        let may_admin = caller.admin || self.is_admin(forwarded);
+        let (write, admin) = match single_header(headers, FORWARDED_ACCESS_HEADER)
+            .map_err(|()| AuthError::UntrustedForwarder)?
+            .map(str::to_ascii_lowercase)
+            .as_deref()
         {
-            return Ok(Principal {
-                name: forwarded.to_string(),
-                write: caller.write,
-                admin: self.is_admin(forwarded),
-                anonymous: false,
-            });
-        }
-        Ok(caller)
+            None => (caller.write, self.is_admin(forwarded)),
+            Some("read") => (false, false),
+            Some("write") => (caller.write, false),
+            Some("admin") => (caller.write, may_admin),
+            Some(other) => {
+                tracing::warn!(
+                    access = other,
+                    "unknown X-Walgit-Access from a trusted forwarder; refused"
+                );
+                return Err(AuthError::UntrustedForwarder);
+            }
+        };
+        let owners = match single_header(headers, FORWARDED_OWNERS_HEADER) {
+            Ok(None) => OwnerScope::All,
+            Ok(Some(v)) => OwnerScope::parse(v).ok_or(AuthError::UntrustedForwarder)?,
+            Err(()) => return Err(AuthError::UntrustedForwarder),
+        };
+        Ok(Principal {
+            name: forwarded.to_string(),
+            write,
+            admin,
+            anonymous: false,
+            owners,
+        })
+    }
+
+    /// Whether `owner` is outside the caller's owner scope (a trusted forwarder's
+    /// `X-Walgit-Owners` that does not name it). Authenticates only when the header is
+    /// there, so other requests pay nothing. A request that does not authenticate is not
+    /// hidden here — its handler answers with its own 401/403, so the credential story
+    /// (git's `erase` on a real 401, the in-band help) stays in one place.
+    pub async fn hides_owner(&self, headers: &HeaderMap, owner: &str) -> bool {
+        headers.contains_key(FORWARDED_OWNERS_HEADER)
+            && self
+                .authenticate_with_forwarding(headers)
+                .await
+                .is_ok_and(|p| !p.sees_owner(owner))
     }
 
     /// A static token or an issued access token, from a bearer or a Basic password.
@@ -656,6 +795,7 @@ impl Authenticator {
                 write: st.write,
                 admin: st.admin,
                 anonymous: false,
+                owners: OwnerScope::All,
             }));
         }
         if tok.starts_with(ACCESS_TOKEN_PREFIX) {
@@ -674,6 +814,7 @@ impl Authenticator {
                 write: true,
                 admin: true,
                 anonymous: false,
+                owners: OwnerScope::All,
             }),
             AuthMode::Token => {
                 let presented =
@@ -821,6 +962,7 @@ impl Authenticator {
             write,
             admin: self.is_admin(&email),
             anonymous: false,
+            owners: OwnerScope::All,
         })
     }
 }
@@ -851,13 +993,20 @@ pub enum AuthError {
     Unauthorized,
     Forbidden,
     Unavailable,
+    /// A forwarded request walgit cannot take as meant: the forwarder's own credential
+    /// failed or is missing, the caller is not a trusted forwarder but sent
+    /// `X-Walgit-Access` / `X-Walgit-Owners`, or a forwarding header is repeated or
+    /// malformed. A 403 naming the forwarder, never a 401: the user's credential is not what
+    /// failed, and a 401 is what makes git erase it (§1.3). Not a 5xx either: a gateway
+    /// retries 5xx from its upstream.
+    UntrustedForwarder,
 }
 
 impl AuthError {
     pub fn status(&self) -> StatusCode {
         match self {
             AuthError::Invalid | AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
-            AuthError::Forbidden => StatusCode::FORBIDDEN,
+            AuthError::Forbidden | AuthError::UntrustedForwarder => StatusCode::FORBIDDEN,
             AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -971,11 +1120,15 @@ fn resolve_tokens(tokens: &[StaticToken]) -> Vec<StaticToken> {
     tokens
         .iter()
         .map(|t| {
+            // Trimmed like the bearer it is compared with (`parse_bearer`): a token file or
+            // Kubernetes `Secret` ending in a newline must still match.
             let token = t
                 .token_env
                 .as_ref()
                 .and_then(|v| std::env::var(v).ok())
-                .unwrap_or_else(|| t.token.clone());
+                .unwrap_or_else(|| t.token.clone())
+                .trim()
+                .to_string();
             StaticToken {
                 principal: t.principal.clone(),
                 token,
@@ -1214,6 +1367,210 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         cfg.server.auth.trusted_forwarders.clear();
         let auth = Authenticator::new(&cfg);
         assert_eq!(auth.authenticate(&headers).await.unwrap().name, "front");
+    }
+
+    /// A gateway forwarder with a write+admin token, and a read-only robot token.
+    fn gateway_config() -> walgit_config::Config {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.anonymous_read = false;
+        let mut gw = static_token("gw", "gw-token", true);
+        gw.admin = true;
+        cfg.server.auth.tokens = vec![
+            gw,
+            static_token("front", "front-token", true),
+            static_token("robot", "robot-token", false),
+        ];
+        cfg.server.auth.trusted_forwarders = vec!["gw".into(), "front".into()];
+        cfg.server.auth.admin_emails = vec!["boss@example.com".into()];
+        cfg
+    }
+
+    fn forwarded(token: &str, user: &str, extra: &[(&str, &str)]) -> HeaderMap {
+        let mut h = bearer(token);
+        h.insert(PRINCIPAL_HEADER, user.parse().unwrap());
+        for (k, v) in extra {
+            h.append(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[tokio::test]
+    async fn a_forwarders_token_is_the_ceiling_and_x_walgit_access_only_narrows() {
+        let auth = Authenticator::new(&gateway_config());
+        let bits = |p: Principal| (p.name, p.write, p.admin);
+        let dev = "dev@example.com";
+        // Absent: exactly as before (the forwarder's write, walgit's own admin grants).
+        let p = auth
+            .authenticate(&forwarded("gw-token", dev, &[]))
+            .await
+            .unwrap();
+        assert_eq!(bits(p), (dev.into(), true, false));
+        // Present: the forwarder decides per request, up to its own token.
+        for (access, write, admin) in [
+            ("read", false, false),
+            ("write", true, false),
+            ("admin", true, true),
+            (" Admin ", true, true),
+        ] {
+            let h = forwarded("gw-token", dev, &[(FORWARDED_ACCESS_HEADER, access)]);
+            let p = auth.authenticate(&h).await.unwrap();
+            assert_eq!(bits(p), (dev.into(), write, admin), "{access}");
+        }
+        let read = forwarded("gw-token", dev, &[(FORWARDED_ACCESS_HEADER, "read")]);
+        auth.require_read(&read).await.unwrap();
+        assert!(matches!(
+            auth.require_write(&read).await,
+            Err(AuthError::Forbidden)
+        ));
+        // A forwarder without admin cannot grant it: clamped, not refused.
+        let h = forwarded("front-token", dev, &[(FORWARDED_ACCESS_HEADER, "admin")]);
+        assert_eq!(
+            bits(auth.authenticate(&h).await.unwrap()),
+            (dev.into(), true, false)
+        );
+        // ...unless walgit itself makes the user admin; and the header narrows that too.
+        let boss = "boss@example.com";
+        let h = forwarded("front-token", boss, &[(FORWARDED_ACCESS_HEADER, "admin")]);
+        assert_eq!(
+            bits(auth.authenticate(&h).await.unwrap()),
+            (boss.into(), true, true)
+        );
+        let h = forwarded("gw-token", boss, &[(FORWARDED_ACCESS_HEADER, "read")]);
+        assert_eq!(
+            bits(auth.authenticate(&h).await.unwrap()),
+            (boss.into(), false, false)
+        );
+        // Unknown or repeated: refused as the forwarder's fault, never a default.
+        for extra in [
+            &[(FORWARDED_ACCESS_HEADER, "owner")][..],
+            &[(FORWARDED_ACCESS_HEADER, "")][..],
+            &[
+                (FORWARDED_ACCESS_HEADER, "read"),
+                (FORWARDED_ACCESS_HEADER, "admin"),
+            ][..],
+        ] {
+            let h = forwarded("gw-token", dev, extra);
+            assert!(
+                matches!(
+                    auth.authenticate(&h).await,
+                    Err(AuthError::UntrustedForwarder)
+                ),
+                "{extra:?}"
+            );
+        }
+        let mut twice = forwarded("gw-token", dev, &[]);
+        twice.append(PRINCIPAL_HEADER, "root@example.com".parse().unwrap());
+        assert!(matches!(
+            auth.authenticate(&twice).await,
+            Err(AuthError::UntrustedForwarder)
+        ));
+    }
+
+    #[tokio::test]
+    async fn narrowing_headers_are_never_dropped_and_a_bad_forwarder_token_is_not_a_401() {
+        let auth = Authenticator::new(&gateway_config());
+        let dev = "dev@example.com";
+        // From a caller that is not a trusted forwarder (a read-only robot):
+        // ignoring them would serve more than the sender decided, so the request is refused.
+        for (token, extra) in [
+            ("robot-token", &[(FORWARDED_ACCESS_HEADER, "read")][..]),
+            ("robot-token", &[(FORWARDED_OWNERS_HEADER, "acme")][..]),
+        ] {
+            let h = forwarded(token, dev, extra);
+            assert!(
+                matches!(
+                    auth.authenticate(&h).await,
+                    Err(AuthError::UntrustedForwarder)
+                ),
+                "{token} {extra:?}"
+            );
+        }
+        // Without naming a user: refused too (the forwarder would otherwise act unnarrowed).
+        let mut h = bearer("gw-token");
+        h.insert(FORWARDED_ACCESS_HEADER, "read".parse().unwrap());
+        assert!(matches!(
+            auth.authenticate(&h).await,
+            Err(AuthError::UntrustedForwarder)
+        ));
+        // An untrusted caller's bare X-Walgit-Principal is still just ignored.
+        let h = forwarded("robot-token", dev, &[]);
+        assert_eq!(auth.authenticate(&h).await.unwrap().name, "robot");
+
+        // The forwarder's own credential wrong or missing: a 403 naming the forwarder. A 401
+        // would make git erase the *user's* stored credential, which was never presented.
+        let mut no_token = HeaderMap::new();
+        no_token.insert(PRINCIPAL_HEADER, dev.parse().unwrap());
+        no_token.insert(FORWARDED_ACCESS_HEADER, "write".parse().unwrap());
+        for h in [
+            forwarded("stale-token", dev, &[]),
+            forwarded("stale-token", dev, &[(FORWARDED_ACCESS_HEADER, "read")]),
+            no_token,
+        ] {
+            let err = auth.require_read(&h).await.unwrap_err();
+            assert!(matches!(err, AuthError::UntrustedForwarder), "{err:?}");
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        }
+        // Not forwarding: a dead credential is still a real 401.
+        assert!(matches!(
+            auth.authenticate(&bearer("stale-token")).await,
+            Err(AuthError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_forwarder_narrows_the_owners_that_exist_for_the_user() {
+        assert_eq!(OwnerScope::parse("*"), Some(OwnerScope::All));
+        assert_eq!(
+            OwnerScope::parse("acme, tools-2,,"),
+            Some(OwnerScope::Only(vec!["acme".into(), "tools-2".into()]))
+        );
+        assert_eq!(OwnerScope::parse(""), Some(OwnerScope::Only(vec![])));
+        for bad in ["*,acme", "acme/app", "../x", ".hidden", "a b"] {
+            assert_eq!(OwnerScope::parse(bad), None, "{bad}");
+        }
+        let auth = Authenticator::new(&gateway_config());
+        let scoped = |owners: &str| {
+            forwarded(
+                "gw-token",
+                "dev@example.com",
+                &[(FORWARDED_OWNERS_HEADER, owners)],
+            )
+        };
+        let p = auth.authenticate(&scoped("acme,tools")).await.unwrap();
+        assert!(p.sees_owner("acme") && p.sees_owner("tools") && !p.sees_owner("other"));
+        assert!(auth.hides_owner(&scoped("acme"), "other").await);
+        assert!(!auth.hides_owner(&scoped("acme"), "acme").await);
+        assert!(!auth.hides_owner(&scoped("*"), "other").await);
+        assert!(
+            auth.hides_owner(&scoped(""), "acme").await,
+            "empty = no owners"
+        );
+        assert!(matches!(
+            auth.authenticate(&scoped("acme/app")).await,
+            Err(AuthError::UntrustedForwarder)
+        ));
+        // No header: nothing hidden, nothing authenticated for it.
+        assert!(!auth.hides_owner(&bearer("robot-token"), "other").await);
+        // Not authenticated: not hidden (the handler answers 403/401 itself).
+        let mut h = scoped("acme");
+        h.insert(AUTHORIZATION, "Bearer stale".parse().unwrap());
+        assert!(!auth.hides_owner(&h, "other").await);
+    }
+
+    #[tokio::test]
+    async fn a_token_from_a_secret_file_with_a_trailing_newline_still_matches() {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.tokens = vec![static_token("gw", "gw-token\n", true)];
+        let auth = Authenticator::new(&cfg);
+        assert_eq!(
+            auth.authenticate(&bearer("gw-token")).await.unwrap().name,
+            "gw"
+        );
     }
 
     #[tokio::test]
