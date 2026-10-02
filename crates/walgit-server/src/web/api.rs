@@ -224,6 +224,7 @@ pub(crate) fn auth_err(e: AuthError) -> ApiError {
     match e {
         AuthError::Invalid | AuthError::Unauthorized => ApiError::Unauthorized,
         AuthError::Forbidden => ApiError::Forbidden,
+        AuthError::UntrustedProxy => ApiError::UntrustedProxy,
         AuthError::Unavailable => ApiError::ServiceUnavailable("auth provider unavailable".into()),
     }
 }

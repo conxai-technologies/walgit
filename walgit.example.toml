@@ -5,8 +5,7 @@
 # Validate with: walgit --config walgit.toml config check
 
 [server]
-listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc
-                                  # (or proxy with proxy_secret_env).
+listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc/proxy.
 http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
 max_concurrent_requests = 512     # global cap on in-flight git requests
 max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
@@ -67,9 +66,11 @@ anonymous_read = true             # must be false in oidc and proxy mode
 # audiences = []                           # oidc: `aud` values accepted on bearer ID tokens clients mint themselves;
 #                                          #       the configured web client is always accepted
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
-# proxy_secret_env = "WALGIT_PROXY_SECRET"   # proxy: env var holding the secret (>= 32 bytes) the proxy sends as
-#                                          #        X-Walgit-Proxy-Secret; required unless listen is loopback (sidecar).
-#                                          #        Unset/short at startup = the server refuses to start.
+# proxy_secret_env = "WALGIT_PROXY_SECRET"   # proxy: env var holding the secret the proxy sends as X-Walgit-Proxy-Secret;
+#                                          #        required, loopback listen included (a sidecar's pod shares loopback).
+#                                          #        Trimmed (a trailing newline is fine), >= 32 bytes; unset/blank/short
+#                                          #        at startup = the server refuses to start. Wrong/missing on a request
+#                                          #        = 403 naming the proxy (never 401: git would drop the user's token).
 
 [store]
 backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)

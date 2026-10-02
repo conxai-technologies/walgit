@@ -156,6 +156,9 @@ pub async fn require_auth(
                 let q = url_encode(&next_url);
                 return Redirect::temporary(&format!("/_auth/login?next={q}")).into_response();
             }
+            if matches!(e, crate::auth::AuthError::UntrustedProxy) {
+                return crate::error::ApiError::UntrustedProxy.into_response();
+            }
             let status = match e {
                 crate::auth::AuthError::Forbidden => StatusCode::FORBIDDEN,
                 crate::auth::AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,

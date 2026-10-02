@@ -146,7 +146,7 @@ each repository one maintainer (placement globs) and you are done.
 | `none` | everyone is `anon` with write and admin — loopback experiments | nothing |
 | `token` | static `tokens` in the config (`token_env` reads the secret from the environment) | `Authorization: Bearer <token>`, or the token as an HTTP Basic password |
 | `oidc` | any OpenID Connect issuer (`issuer`, `oauth_client_id/secret`, `allowed_domains`/`allowed_emails`): Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab… | a **walgit access token**: sign in once in the browser, create one at `/_auth/tokens`, paste it into the installer. Stateless (HMAC with `session_secret`, `access_token_ttl`); rotating the secret revokes all. ID tokens from the issuer (`audiences`) and static `tokens` work too. |
-| `proxy` | whoever an identity-aware proxy in front lets through: it asserts `X-Walgit-Principal`, `X-Walgit-Access` (`read`/`write`/`admin`) and optionally `X-Walgit-Owners`, and proves itself with `X-Walgit-Proxy-Secret` (`proxy_secret_env`) unless walgit listens on loopback | whatever the proxy accepts (its own tokens, mTLS, a session) — walgit never sees the credential |
+| `proxy` | whoever an identity-aware proxy in front lets through: it asserts `X-Walgit-Principal`, `X-Walgit-Access` (`read`/`write`/`admin`) and optionally `X-Walgit-Owners`, and proves itself with `X-Walgit-Proxy-Secret` (`proxy_secret_env`, required — loopback too) | whatever the proxy accepts (its own tokens, mTLS, a session) — walgit never sees the credential |
 
 Developer setup is one idempotent command — `sh -c "$(curl -fsSL 'https://git.example.com/services/public/install.sh')"` —
 which stores the token in a file only the user can read, installs a tiny git credential helper (git ≥ 2.46: it
